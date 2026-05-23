@@ -72,7 +72,10 @@ except Exception:
 try:
     client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
     client.admin.command("ping")
-    db = client.get_default_database()
+    try:
+        db = client.get_default_database()
+    except Exception:
+        db = client["groupbot"]
     logger.info("STEP 5 OK — MongoDB connected: %s", db.name)
 except Exception:
     logger.critical("STEP 5 FAILED — MongoDB connection error:\n%s", traceback.format_exc())
