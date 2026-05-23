@@ -154,9 +154,19 @@ try:
 
     # Passive tracker
     app.add_handler(MessageHandler(
-        filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO,
+        filters.TEXT | filters.PHOTO | filters.VIDEO | filters.AUDIO,
         handlers.message_tracker,
     ), group=2)
+
+    # Error handler — logs full traceback for every handler exception
+    async def error_handler(update, context):
+        logger.error(
+            "HANDLER EXCEPTION — update: %s\n%s",
+            update,
+            "".join(traceback.format_exception(type(context.error), context.error, context.error.__traceback__)),
+        )
+
+    app.add_error_handler(error_handler)
 
     logger.info("STEP 7 OK — All handlers registered.")
 except Exception:
