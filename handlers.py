@@ -58,27 +58,37 @@ def _track_group(chat, db):
         )
 
 
+def _esc(text: str) -> str:
+    """Escape HTML special characters."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 # ─── /start ───────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = _db(context)
-    if db:
-        _track_user(update.effective_user, db)
+    try:
+        db = _db(context)
+        if db:
+            _track_user(update.effective_user, db)
+    except Exception as e:
+        logger.error("start: db track error: %s", e)
+
+    bot_username = context.bot.username or "your_bot"
     keyboard = [
-        [InlineKeyboardButton("➕ Add me to your chat!", url=f"https://t.me/{context.bot.username}?startgroup=true")],
+        [InlineKeyboardButton("➕ Add me to your chat!", url=f"https://t.me/{bot_username}?startgroup=true")],
         [InlineKeyboardButton("🎵 Music bot", url="https://t.me/key_client_bot")],
-        [InlineKeyboardButton("📢 Share this bot", switch_inline_query="")],
+        [InlineKeyboardButton("📢 Share this bot", url=f"https://t.me/{bot_username}")],
         [InlineKeyboardButton("📱 Menu", callback_data="main_menu")],
     ]
     await update.message.reply_text(
-        "👋 *Welcome to the Group Management Bot!*\n\n"
+        "👋 <b>Welcome to the Group Management Bot!</b>\n\n"
         "I help you keep your Telegram groups safe, organized, and engaging.\n\n"
         "✅ Moderation (ban, mute, warn)\n"
         "✅ Welcome messages\n"
         "✅ Group statistics\n"
-        "✅ Broadcast to users & groups\n\n"
+        "✅ Broadcast to users and groups\n\n"
         "Use the buttons below to get started.",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -100,8 +110,8 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         keyboard.append([InlineKeyboardButton("👑 Bot Owner Panel", callback_data="menu_owner")])
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_start")])
     await query.edit_message_text(
-        "📱 *Main Menu*\n\nChoose a category below:",
-        parse_mode="Markdown",
+        "📱 <b>Main Menu</b>\n\nChoose a category below:",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -110,16 +120,16 @@ async def menu_mod_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     text = (
-        "🛡️ *Moderation Guide*\n\n"
-        "*/ban* — Reply to a message to permanently ban that user.\n"
-        "*/unban* `@username` — Remove ban from a user.\n"
-        "*/mute* — Reply to restrict a user from messaging.\n"
-        "*/unmute* — Reply to restore messaging rights.\n"
-        "*/warn* — Reply to warn (auto-ban at 3 warnings).\n\n"
-        "_All commands require admin or owner status._"
+        "🛡️ <b>Moderation Guide</b>\n\n"
+        "/ban — Reply to a message to permanently ban that user.\n"
+        "/unban @username — Remove ban from a user.\n"
+        "/mute — Reply to restrict a user from messaging.\n"
+        "/unmute — Reply to restore messaging rights.\n"
+        "/warn — Reply to warn (auto-ban at 3 warnings).\n\n"
+        "<i>All commands require admin or owner status.</i>"
     )
     await query.edit_message_text(
-        text, parse_mode="Markdown",
+        text, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
     )
 
@@ -128,14 +138,14 @@ async def menu_settings_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     text = (
-        "⚙️ *Chat Settings*\n\n"
-        "*/setwelcome* `[message]` — Set custom welcome message.\n"
-        "  Use `{name}` to mention the new member.\n"
-        "*/clearwelcome* — Remove welcome message.\n\n"
-        "_Restricted to group admins._"
+        "⚙️ <b>Chat Settings</b>\n\n"
+        "/setwelcome [message] — Set custom welcome message.\n"
+        "  Use <code>{name}</code> to mention the new member.\n"
+        "/clearwelcome — Remove welcome message.\n\n"
+        "<i>Restricted to group admins.</i>"
     )
     await query.edit_message_text(
-        text, parse_mode="Markdown",
+        text, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
     )
 
@@ -144,8 +154,8 @@ async def menu_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
-        "📊 *Group Statistics*\n\n*/stats* — View member count and warnings.\n\n_Run inside a group._",
-        parse_mode="Markdown",
+        "📊 <b>Group Statistics</b>\n\n/stats — View member count and warnings.\n\n<i>Run inside a group.</i>",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
     )
 
@@ -157,13 +167,13 @@ async def menu_owner_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     await query.answer()
     text = (
-        "👑 *Bot Owner Panel*\n\n"
-        "*/broadcast* — Send message to users, groups, or everyone.\n"
-        "*/userlist* — List all registered users (@username).\n"
-        "*/grouplist* — List all managed groups (name + ID).\n"
+        "👑 <b>Bot Owner Panel</b>\n\n"
+        "/broadcast — Send message to users, groups, or everyone.\n"
+        "/userlist — List all registered users (@username).\n"
+        "/grouplist — List all managed groups (name + ID).\n"
     )
     await query.edit_message_text(
-        text, parse_mode="Markdown",
+        text, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
     )
 
@@ -171,21 +181,22 @@ async def menu_owner_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def back_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    bot_username = context.bot.username or "your_bot"
     keyboard = [
-        [InlineKeyboardButton("➕ Add me to your chat!", url=f"https://t.me/{context.bot.username}?startgroup=true")],
+        [InlineKeyboardButton("➕ Add me to your chat!", url=f"https://t.me/{bot_username}?startgroup=true")],
         [InlineKeyboardButton("🎵 Music bot", url="https://t.me/key_client_bot")],
-        [InlineKeyboardButton("📢 Share this bot", switch_inline_query="")],
+        [InlineKeyboardButton("📢 Share this bot", url=f"https://t.me/{bot_username}")],
         [InlineKeyboardButton("📱 Menu", callback_data="main_menu")],
     ]
     await query.edit_message_text(
-        "👋 *Welcome to the Group Management Bot!*\n\n"
+        "👋 <b>Welcome to the Group Management Bot!</b>\n\n"
         "I help you keep your Telegram groups safe, organized, and engaging.\n\n"
         "✅ Moderation (ban, mute, warn)\n"
         "✅ Welcome messages\n"
         "✅ Group statistics\n"
-        "✅ Broadcast to users & groups\n\n"
+        "✅ Broadcast to users and groups\n\n"
         "Use the buttons below to get started.",
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -205,8 +216,8 @@ async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("❌ Cancel", callback_data="bc_cancel")],
     ]
     await update.message.reply_text(
-        "📢 *Broadcast — Choose target:*",
-        parse_mode="Markdown",
+        "📢 <b>Broadcast — Choose target:</b>",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -233,8 +244,8 @@ async def broadcast_target_callback(update: Update, context: ContextTypes.DEFAUL
     await query.answer()
     label = {"users": "👥 All Users", "groups": "🏘️ All Groups", "all": "🌐 Everyone"}[target]
     await query.edit_message_text(
-        f"📢 *Broadcast to {label}*\n\nNow send your message (text, photo, or video):",
-        parse_mode="Markdown",
+        f"📢 <b>Broadcast to {label}</b>\n\nNow send your message (text, photo, or video):",
+        parse_mode="HTML",
     )
 
 
@@ -261,7 +272,7 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for chat_id in recipients:
         try:
             if msg.text:
-                await context.bot.send_message(chat_id, msg.text, parse_mode="Markdown")
+                await context.bot.send_message(chat_id, msg.text)
             elif msg.photo:
                 await context.bot.send_photo(chat_id, msg.photo[-1].file_id, caption=msg.caption or "")
             elif msg.video:
@@ -274,8 +285,8 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
             failed += 1
 
     await update.message.reply_text(
-        f"📢 *Broadcast complete*\n\n✅ Sent: {sent}\n❌ Failed: {failed}",
-        parse_mode="Markdown",
+        f"📢 <b>Broadcast complete</b>\n\n✅ Sent: {sent}\n❌ Failed: {failed}",
+        parse_mode="HTML",
     )
 
 
@@ -292,12 +303,12 @@ async def userlist_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = []
     for i, u in enumerate(users, 1):
-        uname = f"@{u['uname']}" if u.get("uname") else u.get("fname", "Unknown")
-        lines.append(f"{i}. {uname} (`{u['_id']}`)")
-    text = "👥 *Registered Users*\n\n" + "\n".join(lines)
+        uname = f"@{_esc(u['uname'])}" if u.get("uname") else _esc(u.get("fname", "Unknown"))
+        lines.append(f"{i}. {uname} (<code>{u['_id']}</code>)")
+    text = "👥 <b>Registered Users</b>\n\n" + "\n".join(lines)
     if len(users) == 50:
-        text += "\n\n_Showing first 50 users._"
-    await update.message.reply_text(text, parse_mode="Markdown")
+        text += "\n\n<i>Showing first 50 users.</i>"
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def grouplist_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -311,12 +322,12 @@ async def grouplist_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = []
     for i, g in enumerate(groups, 1):
-        title = g.get("title") or "Unnamed Group"
-        lines.append(f"{i}. *{title}*\n   ID: `{g['_id']}`")
-    text = "🏘️ *Managed Groups*\n\n" + "\n".join(lines)
+        title = _esc(g.get("title") or "Unnamed Group")
+        lines.append(f"{i}. <b>{title}</b>\n   ID: <code>{g['_id']}</code>")
+    text = "🏘️ <b>Managed Groups</b>\n\n" + "\n".join(lines)
     if len(groups) == 50:
-        text += "\n\n_Showing first 50 groups._"
-    await update.message.reply_text(text, parse_mode="Markdown")
+        text += "\n\n<i>Showing first 50 groups.</i>"
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 # ─── Moderation ───────────────────────────────────────────────────────────────
@@ -331,7 +342,9 @@ async def ban_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = update.message.reply_to_message.from_user
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, target.id)
-        await update.message.reply_text(f"🔨 *{target.full_name}* has been banned.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"🔨 <b>{_esc(target.full_name)}</b> has been banned.", parse_mode="HTML"
+        )
         logger.info("BANNED user %s (%s) from chat %s", target.id, target.full_name, update.effective_chat.id)
     except Exception as e:
         logger.error("Ban error: %s", e)
@@ -349,7 +362,9 @@ async def unban_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = await context.bot.get_chat(f"@{username}")
         await context.bot.unban_chat_member(update.effective_chat.id, user.id)
-        await update.message.reply_text(f"✅ *{user.full_name}* has been unbanned.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"✅ <b>{_esc(user.full_name)}</b> has been unbanned.", parse_mode="HTML"
+        )
     except Exception as e:
         logger.error("Unban error: %s", e)
         await update.message.reply_text("❌ Could not unban. Make sure the username is correct.")
@@ -368,7 +383,9 @@ async def mute_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update.effective_chat.id, target.id,
             ChatPermissions(can_send_messages=False),
         )
-        await update.message.reply_text(f"🔇 *{target.full_name}* has been muted.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"🔇 <b>{_esc(target.full_name)}</b> has been muted.", parse_mode="HTML"
+        )
     except Exception as e:
         logger.error("Mute error: %s", e)
         await update.message.reply_text("❌ Could not mute user. Check my admin permissions.")
@@ -392,7 +409,9 @@ async def unmute_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 can_add_web_page_previews=True,
             ),
         )
-        await update.message.reply_text(f"🔊 *{target.full_name}* has been unmuted.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"🔊 <b>{_esc(target.full_name)}</b> has been unmuted.", parse_mode="HTML"
+        )
     except Exception as e:
         logger.error("Unmute error: %s", e)
         await update.message.reply_text("❌ Could not unmute user.")
@@ -422,14 +441,14 @@ async def warn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.ban_chat_member(update.effective_chat.id, target.id)
             db["users"].update_one({"_id": target.id}, {"$set": {"w_cnt": 0}})
             await update.message.reply_text(
-                f"🔨 *{target.full_name}* banned after 3 warnings.", parse_mode="Markdown"
+                f"🔨 <b>{_esc(target.full_name)}</b> banned after 3 warnings.", parse_mode="HTML"
             )
         except Exception as e:
             logger.error("Auto-ban after warn error: %s", e)
     else:
         await update.message.reply_text(
-            f"⚠️ *{target.full_name}* warned ({warn_count}/3).\nReason: {reason}",
-            parse_mode="Markdown",
+            f"⚠️ <b>{_esc(target.full_name)}</b> warned ({warn_count}/3).\nReason: {_esc(reason)}",
+            parse_mode="HTML",
         )
 
 
@@ -444,9 +463,9 @@ async def bot_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 _track_group(chat, db)
             logger.info("Bot added to group: %s (%s)", chat.title, chat.id)
             await update.message.reply_text(
-                f"👋 Thanks for adding me to *{chat.title}*!\n"
+                f"👋 Thanks for adding me to <b>{_esc(chat.title)}</b>!\n"
                 "Give me admin rights to enable all features.",
-                parse_mode="Markdown",
+                parse_mode="HTML",
             )
             break
 
@@ -464,10 +483,14 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             continue
         if db:
             _track_user(member, db)
-        text = custom_welcome or "👋 Welcome to the group, *{name}*! Please read the rules."
-        await update.message.reply_text(
-            text.replace("{name}", member.full_name), parse_mode="Markdown"
-        )
+        if custom_welcome:
+            text = custom_welcome.replace("{name}", member.full_name)
+            await update.message.reply_text(text)
+        else:
+            await update.message.reply_text(
+                f"👋 Welcome to the group, <b>{_esc(member.full_name)}</b>! Please read the rules.",
+                parse_mode="HTML",
+            )
 
 
 async def setwelcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -507,10 +530,10 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         member_count = "N/A"
     warned_users = db["users"].count_documents({"w_cnt": {"$gt": 0}}) if db else 0
     await update.message.reply_text(
-        f"📊 *Group Statistics*\n\n"
+        f"📊 <b>Group Statistics</b>\n\n"
         f"👥 Members: {member_count}\n"
         f"⚠️ Users with active warnings: {warned_users}",
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 
