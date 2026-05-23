@@ -83,8 +83,7 @@ def main():
     dp.add_handler(CommandHandler("broadcast", handlers.broadcast_handler))
     dp.add_handler(CallbackQueryHandler(handlers.broadcast_target_callback, pattern="^bc_"))
     dp.add_handler(MessageHandler(
-        Filters.user(OWNER_ID) & Filters.chat_type.private &
-        ~Filters.command & Filters.update.message,
+        Filters.user(OWNER_ID) & Filters.private & ~Filters.command,
         partial(handlers.broadcast_send, db=db),
     ))
 
@@ -112,7 +111,7 @@ def main():
     dp.add_handler(MessageHandler(
         Filters.status_update.new_chat_members,
         partial(handlers.welcome_new_member, db=db),
-    ))
+    ), group=1)
 
     # ── Passive tracker (stores users & groups silently) ─────────────────────
     dp.add_handler(MessageHandler(
