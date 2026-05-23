@@ -3,11 +3,9 @@ import sys
 import traceback
 import logging
 
-# Force stdout to flush immediately so Render captures every line
 sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
-# ─── Logging (must come before any other import that might fail) ───────────────
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
@@ -17,24 +15,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 logger.info("=" * 60)
-logger.info("BOT STARTING UP")
+logger.info("BOT STARTING UP  (python-telegram-bot v20)")
 logger.info("=" * 60)
 
-# ─── Step 1: Check env vars BEFORE importing anything heavy ──────────────────
+# ─── Step 1: Env vars ─────────────────────────────────────────────────────────
 logger.info("STEP 1 — Checking environment variables...")
-BOT_TOKEN   = os.environ.get("BOT_TOKEN")
-MONGODB_URI = os.environ.get("MONGODB_URI")
+BOT_TOKEN    = os.environ.get("BOT_TOKEN")
+MONGODB_URI  = os.environ.get("MONGODB_URI")
 OWNER_ID_RAW = os.environ.get("OWNER_ID")
 
-missing = [k for k, v in [
-    ("BOT_TOKEN",   BOT_TOKEN),
-    ("MONGODB_URI", MONGODB_URI),
-    ("OWNER_ID",    OWNER_ID_RAW),
-] if not v]
-
+missing = [k for k, v in [("BOT_TOKEN", BOT_TOKEN), ("MONGODB_URI", MONGODB_URI), ("OWNER_ID", OWNER_ID_RAW)] if not v]
 if missing:
-    logger.critical("MISSING ENV VARS: %s", ", ".join(missing))
-    logger.critical("Go to Render > Environment and add these variables, then redeploy.")
+    logger.critical("MISSING ENV VARS: %s — Add in Render > Environment then redeploy.", ", ".join(missing))
     sys.exit(1)
 
 try:
@@ -45,18 +37,17 @@ except ValueError:
 
 logger.info("STEP 1 OK — BOT_TOKEN: set | MONGODB_URI: set | OWNER_ID: %s", OWNER_ID)
 
-# ─── Step 2: Import telegram library ─────────────────────────────────────────
-logger.info("STEP 2 — Importing python-telegram-bot...")
+# ─── Step 2: Import PTB v20 ───────────────────────────────────────────────────
+logger.info("STEP 2 — Importing python-telegram-bot v20...")
 try:
-    from functools import partial
     from telegram.ext import (
-        Updater,
+        Application,
         CommandHandler,
         CallbackQueryHandler,
         MessageHandler,
-        Filters,
+        filters,
     )
-    logger.info("STEP 2 OK — telegram library imported successfully.")
+    logger.info("STEP 2 OK — PTB v20 imported successfully.")
 except Exception:
     logger.critical("STEP 2 FAILED — Could not import telegram library.")
     logger.critical(traceback.format_exc())
@@ -66,7 +57,7 @@ except Exception:
 logger.info("STEP 3 — Importing pymongo...")
 try:
     from pymongo import MongoClient
-    logger.info("STEP 3 OK — pymongo imported successfully.")
+    logger.info("STEP 3 OK — pymongo imported.")
 except Exception:
     logger.critical("STEP 3 FAILED — Could not import pymongo.")
     logger.critical(traceback.format_exc())
@@ -78,7 +69,7 @@ try:
     from keep_alive import keep_alive
     logger.info("STEP 4a OK — keep_alive imported.")
 except Exception:
-    logger.critical("STEP 4a FAILED — Could not import keep_alive.")
+    logger.critical("STEP 4a FAILED — keep_alive import error.")
     logger.critical(traceback.format_exc())
     sys.exit(1)
 
@@ -86,11 +77,11 @@ try:
     import handlers
     logger.info("STEP 4b OK — handlers imported.")
 except Exception:
-    logger.critical("STEP 4b FAILED — Could not import handlers.")
+    logger.critical("STEP 4b FAILED — handlers import error.")
     logger.critical(traceback.format_exc())
     sys.exit(1)
 
-# ─── Step 5: Connect to MongoDB ──────────────────────────────────────────────
+# ─── Step 5: MongoDB ──────────────────────────────────────────────────────────
 logger.info("STEP 5 — Connecting to MongoDB...")
 try:
     client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=8000)
@@ -102,8 +93,8 @@ except Exception:
     logger.critical(traceback.format_exc())
     sys.exit(1)
 
-# ─── Step 6: Start Flask keep-alive ──────────────────────────────────────────
-logger.info("STEP 6 — Starting Flask keep-alive server...")
+# ─── Step 6: Flask keep-alive ─────────────────────────────────────────────────
+logger.info("STEP 6 — Starting Flask keep-alive...")
 try:
     keep_alive()
     logger.info("STEP 6 OK — Flask keep-alive started.")
@@ -112,51 +103,59 @@ except Exception:
     logger.critical(traceback.format_exc())
     sys.exit(1)
 
-# ─── Step 7: Register Telegram handlers ──────────────────────────────────────
-logger.info("STEP 7 — Creating Updater and registering handlers...")
+# ─── Step 7: Build application & register handlers ───────────────────────────
+logger.info("STEP 7 — Building Application and registering handlers...")
 try:
-    updater = Updater(token=BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.bot_data["db"] = db
 
-    dp.add_handler(CommandHandler("start", partial(handlers.start, db=db)))
+    # /start
+    app.add_handler(CommandHandler("start", handlers.start))
 
-    dp.add_handler(CallbackQueryHandler(handlers.main_menu_callback,     pattern="^main_menu$"))
-    dp.add_handler(CallbackQueryHandler(handlers.menu_mod_callback,      pattern="^menu_mod$"))
-    dp.add_handler(CallbackQueryHandler(handlers.menu_settings_callback, pattern="^menu_settings$"))
-    dp.add_handler(CallbackQueryHandler(handlers.menu_stats_callback,    pattern="^menu_stats$"))
-    dp.add_handler(CallbackQueryHandler(handlers.menu_owner_callback,    pattern="^menu_owner$"))
-    dp.add_handler(CallbackQueryHandler(handlers.back_start_callback,    pattern="^back_start$"))
+    # Menu navigation
+    app.add_handler(CallbackQueryHandler(handlers.main_menu_callback,     pattern="^main_menu$"))
+    app.add_handler(CallbackQueryHandler(handlers.menu_mod_callback,      pattern="^menu_mod$"))
+    app.add_handler(CallbackQueryHandler(handlers.menu_settings_callback, pattern="^menu_settings$"))
+    app.add_handler(CallbackQueryHandler(handlers.menu_stats_callback,    pattern="^menu_stats$"))
+    app.add_handler(CallbackQueryHandler(handlers.menu_owner_callback,    pattern="^menu_owner$"))
+    app.add_handler(CallbackQueryHandler(handlers.back_start_callback,    pattern="^back_start$"))
 
-    dp.add_handler(CommandHandler("broadcast",   handlers.broadcast_handler))
-    dp.add_handler(CallbackQueryHandler(handlers.broadcast_target_callback, pattern="^bc_"))
-    dp.add_handler(MessageHandler(
-        Filters.user(OWNER_ID) & Filters.chat_type.private & ~Filters.command,
-        partial(handlers.broadcast_send, db=db),
+    # Broadcast
+    app.add_handler(CommandHandler("broadcast", handlers.broadcast_handler))
+    app.add_handler(CallbackQueryHandler(handlers.broadcast_target_callback, pattern="^bc_"))
+    app.add_handler(MessageHandler(
+        filters.User(OWNER_ID) & filters.ChatType.PRIVATE & ~filters.COMMAND,
+        handlers.broadcast_send,
     ))
 
-    dp.add_handler(CommandHandler("userlist",    partial(handlers.userlist_handler,    db=db)))
-    dp.add_handler(CommandHandler("grouplist",   partial(handlers.grouplist_handler,   db=db)))
-    dp.add_handler(CommandHandler("ban",         handlers.ban_handler))
-    dp.add_handler(CommandHandler("unban",       handlers.unban_handler))
-    dp.add_handler(CommandHandler("mute",        handlers.mute_handler))
-    dp.add_handler(CommandHandler("unmute",      handlers.unmute_handler))
-    dp.add_handler(CommandHandler("warn",        partial(handlers.warn_handler,        db=db)))
-    dp.add_handler(CommandHandler("setwelcome",  partial(handlers.setwelcome_handler,  db=db)))
-    dp.add_handler(CommandHandler("clearwelcome",partial(handlers.clearwelcome_handler,db=db)))
-    dp.add_handler(CommandHandler("stats",       partial(handlers.stats_handler,       db=db)))
+    # Owner tools
+    app.add_handler(CommandHandler("userlist",    handlers.userlist_handler))
+    app.add_handler(CommandHandler("grouplist",   handlers.grouplist_handler))
 
-    dp.add_handler(MessageHandler(
-        Filters.status_update.new_chat_members,
-        partial(handlers.bot_added_to_group, db=db),
+    # Moderation
+    app.add_handler(CommandHandler("ban",         handlers.ban_handler))
+    app.add_handler(CommandHandler("unban",       handlers.unban_handler))
+    app.add_handler(CommandHandler("mute",        handlers.mute_handler))
+    app.add_handler(CommandHandler("unmute",      handlers.unmute_handler))
+    app.add_handler(CommandHandler("warn",        handlers.warn_handler))
+
+    # Chat settings
+    app.add_handler(CommandHandler("setwelcome",  handlers.setwelcome_handler))
+    app.add_handler(CommandHandler("clearwelcome",handlers.clearwelcome_handler))
+    app.add_handler(CommandHandler("stats",       handlers.stats_handler))
+
+    # Auto-events (group=0 and group=1 so both run)
+    app.add_handler(MessageHandler(
+        filters.StatusUpdate.NEW_CHAT_MEMBERS, handlers.bot_added_to_group
     ))
-    dp.add_handler(MessageHandler(
-        Filters.status_update.new_chat_members,
-        partial(handlers.welcome_new_member, db=db),
+    app.add_handler(MessageHandler(
+        filters.StatusUpdate.NEW_CHAT_MEMBERS, handlers.welcome_new_member
     ), group=1)
 
-    dp.add_handler(MessageHandler(
-        Filters.text | Filters.photo | Filters.video | Filters.document | Filters.audio,
-        partial(handlers.message_tracker, db=db),
+    # Passive tracker
+    app.add_handler(MessageHandler(
+        filters.TEXT | filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.AUDIO,
+        handlers.message_tracker,
     ), group=2)
 
     logger.info("STEP 7 OK — All handlers registered.")
@@ -166,12 +165,11 @@ except Exception:
     sys.exit(1)
 
 # ─── Step 8: Start polling ────────────────────────────────────────────────────
-logger.info("STEP 8 — Starting polling loop...")
+logger.info("STEP 8 — Starting polling...")
 try:
-    updater.start_polling()
     logger.info("STEP 8 OK — Bot is live and polling. Ready to receive messages.")
     logger.info("=" * 60)
-    updater.idle()
+    app.run_polling()
 except Exception:
     logger.critical("STEP 8 FAILED — Polling error.")
     logger.critical(traceback.format_exc())
