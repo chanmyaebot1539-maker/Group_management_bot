@@ -1,10 +1,12 @@
 """
 handlers.py — Group Management Bot (PTB v20)
-All handlers. MongoDB short-key schema. HTML parse mode throughout.
+Strict chat-type routing, hardened permission checks, HTML parse mode.
 """
 import os
+import re
 import time
 import logging
+import asyncio
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -14,19 +16,21 @@ from telegram import (
     InlineKeyboardMarkup,
     ChatPermissions,
 )
-from telegram.constants import ChatMemberStatus
+from telegram.constants import ChatMemberStatus, ChatType
+from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import ContextTypes
 
 logger = logging.getLogger(__name__)
 
-# ─── Constants ────────────────────────────────────────────────────────────────
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 BROADCAST_TARGET_KEY = "broadcast_target"
+URL_RE = re.compile(r"(https?://|t\.me/|www\.)", re.IGNORECASE)
 
 # Anti-flood in-memory store: {chat_id: {user_id: [timestamps]}}
 _flood_cache: dict = defaultdict(lambda: defaultdict(list))
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+# ─── Core Helpers ─────────────────────────────────────────────────────────────
 
 def _db(context: ContextTypes.DEFAULT_TYPE):
     return context.bot_data.get("db")
@@ -56,7 +60,7 @@ def _track_user(user, db):
 
 
 def _track_group(chat, db):
-    if chat and chat.type in ("group", "supergroup"):
+    if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         db["groups"].update_one(
             {"_id": chat.id},
             {"$set": {"title": chat.title or ""}},
@@ -64,19 +68,76 @@ def _track_group(chat, db):
         )
 
 
+# ─── Routing Guards ───────────────────────────────────────────────────────────
+
+async def _require_private(update: Update) -> bool:
+    """Returns True if this is a private chat; otherwise replies and returns False."""
+    if update.effective_chat.type != ChatType.PRIVATE:
+        try:
+            await update.message.reply_text(
+                "❌ Please use this command in my Private Message (PM) context."
+            )
+        except Exception:
+            pass
+        return False
+    return True
+
+
+async def _require_group(update: Update) -> bool:
+    """Returns True if this is a group/supergroup; otherwise replies and returns False."""
+    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        try:
+            await update.message.reply_text(
+                "❌ This command can only be used inside a Telegram Group."
+            )
+        except Exception:
+            pass
+        return False
+    return True
+
+
+# ─── Permission Check ─────────────────────────────────────────────────────────
+
 async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user_id = update.effective_user.id
     if user_id == OWNER_ID:
         return True
     chat = update.effective_chat
-    if not chat or chat.type == "private":
+    if not chat or chat.type == ChatType.PRIVATE:
         return False
     try:
         member = await context.bot.get_chat_member(chat.id, user_id)
         return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
-    except Exception as e:
-        logger.error("_is_admin error: %s", e)
+    except TelegramError as e:
+        logger.warning("get_chat_member error: %s", e)
         return False
+
+
+async def _require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Checks admin/owner status.
+    On failure: silently deletes their command, sends a brief notice.
+    """
+    if await _is_admin(update, context):
+        return True
+    # Delete the unauthorized command to keep chat clean
+    try:
+        await update.message.delete()
+    except (BadRequest, Forbidden):
+        pass
+    # Send a brief notice
+    try:
+        notice = await context.bot.send_message(
+            update.effective_chat.id,
+            "⛔ <b>Admins only.</b> You don't have permission to use this command.",
+            parse_mode="HTML",
+        )
+        # Auto-delete notice after 5 seconds
+        await asyncio.sleep(5)
+        await notice.delete()
+    except (BadRequest, Forbidden):
+        pass
+    return False
 
 
 async def _get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -88,21 +149,16 @@ async def _get_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             user = await context.bot.get_chat(identifier)
             return user, None
-        except Exception:
+        except TelegramError:
             return None, f"❌ User <code>{_esc(identifier)}</code> not found."
     return None, "↩️ Reply to a user's message or provide @username / user_id."
 
 
-async def _require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not await _is_admin(update, context):
-        await update.message.reply_text("⛔ Admin or owner only.")
-        return False
-    return True
-
-
-# ─── /start ───────────────────────────────────────────────────────────────────
+# ─── /start (PM ONLY) ─────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_private(update):
+        return
     try:
         db = _db(context)
         if db:
@@ -110,10 +166,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error("start db track: %s", e)
 
-    # Check for referral start (e.g. /start ref_12345)
     if context.args and context.args[0].startswith("ref_"):
         ref_id = context.args[0][4:]
-        logger.info("Referral start from ref_%s to user %s", ref_id, update.effective_user.id)
+        logger.info("Referral start ref_%s → user %s", ref_id, update.effective_user.id)
 
     bot_username = context.bot.username or "your_bot"
     keyboard = [
@@ -146,15 +201,18 @@ async def share_bot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
     await query.message.reply_text(
         f"📢 <b>Your referral link:</b>\n<code>{ref_link}</code>\n\n"
-        "Share this link and track who joins via you!",
+        "Share this link to track who joins via you!",
         parse_mode="HTML",
     )
 
 
-# ─── Menu callbacks ───────────────────────────────────────────────────────────
+# ─── Menu Callbacks (PM ONLY) ─────────────────────────────────────────────────
 
 async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.message.chat.type != ChatType.PRIVATE:
+        await query.answer("❌ Use in PM only.", show_alert=True)
+        return
     await query.answer()
     is_owner = query.from_user.id == OWNER_ID
     keyboard = [
@@ -180,6 +238,9 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def menu_mod_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.message.chat.type != ChatType.PRIVATE:
+        await query.answer("❌ Use in PM only.", show_alert=True)
+        return
     await query.answer()
     text = (
         "🛡️ <b>Moderation Commands</b>\n\n"
@@ -188,7 +249,7 @@ async def menu_mod_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/unban @user — Remove a ban\n"
         "/kick — Reply to remove from group\n\n"
         "<b>Mute:</b>\n"
-        "/mute [1m|1h|1d] — Reply to mute (optional duration)\n"
+        "/mute [1m|1h|1d] — Reply to mute\n"
         "/unmute — Reply to restore messaging\n\n"
         "<b>Warnings:</b>\n"
         "/warn — Reply to warn (auto-ban at 3)\n"
@@ -209,6 +270,9 @@ async def menu_mod_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def menu_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.message.chat.type != ChatType.PRIVATE:
+        await query.answer("❌ Use in PM only.", show_alert=True)
+        return
     await query.answer()
     text = (
         "⚙️ <b>Group Settings Commands</b>\n\n"
@@ -223,10 +287,9 @@ async def menu_settings_callback(update: Update, context: ContextTypes.DEFAULT_T
         "/stickers on|off — Toggle stickers\n"
         "/media on|off — Toggle media messages\n"
         "/polls on|off — Toggle polls\n"
-        "/setperm &lt;type&gt; on|off — Set any permission\n\n"
+        "/setperm &lt;type&gt; on|off\n\n"
         "<b>Anti-Flood:</b>\n"
-        "/antiflood on|off [limit] [window_sec] [mute_min]\n"
-        "/antiflood — Show current settings\n\n"
+        "/antiflood on|off [limit] [window_sec] [mute_min]\n\n"
         "<b>Cleanup:</b>\n"
         "/cleandeleted — Kick deleted accounts\n"
         "/cleaninactive [days] — Kick inactive members\n"
@@ -239,13 +302,16 @@ async def menu_settings_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 async def menu_locks_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.message.chat.type != ChatType.PRIVATE:
+        await query.answer("❌ Use in PM only.", show_alert=True)
+        return
     await query.answer()
     text = (
         "🔒 <b>Content Lock Commands</b>\n\n"
         "/lock &lt;type&gt; — Activate a content filter\n"
         "/unlock &lt;type&gt; — Deactivate a content filter\n"
         "/locklist — Show all active locks\n"
-        "/ro — Enable read-only mode (non-admins can't send)\n"
+        "/ro — Enable read-only mode\n"
         "/unro — Disable read-only mode\n\n"
         "<b>Lock types:</b> messages, media, stickers, gifs, polls, links\n\n"
         "<b>Welcome &amp; Rules:</b>\n"
@@ -264,24 +330,28 @@ async def menu_locks_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def menu_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.message.chat.type != ChatType.PRIVATE:
+        await query.answer("❌ Use in PM only.", show_alert=True)
+        return
     await query.answer()
-    text = (
+    await query.edit_message_text(
         "ℹ️ <b>Info Commands</b>\n\n"
         "/id — Show your user ID or group chat ID\n"
         "/info [@user] — Show user details\n"
-        "/stats — Group statistics\n"
-    )
-    await query.edit_message_text(
-        text, parse_mode="HTML",
+        "/stats — Group statistics\n",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
     )
 
 
 async def menu_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.message.chat.type != ChatType.PRIVATE:
+        await query.answer("❌ Use in PM only.", show_alert=True)
+        return
     await query.answer()
     await query.edit_message_text(
-        "📊 <b>Group Statistics</b>\n\nUse /stats inside a group to see member count and active warnings.",
+        "📊 <b>Group Statistics</b>\n\nUse /stats inside a group to see member count and warnings.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
     )
@@ -292,21 +362,25 @@ async def menu_owner_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if query.from_user.id != OWNER_ID:
         await query.answer("🛑 Owner only.", show_alert=True)
         return
+    if query.message.chat.type != ChatType.PRIVATE:
+        await query.answer("❌ Use in PM only.", show_alert=True)
+        return
     await query.answer()
-    text = (
+    await query.edit_message_text(
         "👑 <b>Bot Owner Panel</b>\n\n"
         "/broadcast — Send message to users, groups, or everyone\n"
         "/userlist — List all registered users\n"
-        "/grouplist — List all managed groups\n"
-    )
-    await query.edit_message_text(
-        text, parse_mode="HTML",
+        "/grouplist — List all managed groups\n",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
     )
 
 
 async def back_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.message.chat.type != ChatType.PRIVATE:
+        await query.answer("❌ Use in PM only.", show_alert=True)
+        return
     await query.answer()
     bot_username = context.bot.username or "your_bot"
     keyboard = [
@@ -329,9 +403,11 @@ async def back_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 
-# ─── ⚙️ GROUP SETTINGS MODULE ─────────────────────────────────────────────────
+# ─── ⚙️ GROUP SETTINGS (GROUP ONLY) ──────────────────────────────────────────
 
 async def settitle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not context.args:
@@ -341,11 +417,16 @@ async def settitle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.set_chat_title(update.effective_chat.id, title)
         await update.message.reply_text(f"✅ Group title updated to: <b>{_esc(title)}</b>", parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    except BadRequest as e:
+        logger.warning("settitle BadRequest: %s", e)
+        await update.message.reply_text(f"❌ Failed — check bot permissions: <i>{_esc(str(e))}</i>", parse_mode="HTML")
+    except Forbidden as e:
+        await update.message.reply_text("❌ Bot is not an admin or lacks 'Change Group Info' rights.")
 
 
 async def setdesc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not context.args:
@@ -355,11 +436,14 @@ async def setdesc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.set_chat_description(update.effective_chat.id, desc)
         await update.message.reply_text("✅ Group description updated.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("setdesc error: %s", e)
+        await update.message.reply_text("❌ Failed — bot needs 'Change Group Info' permission.")
 
 
 async def setphoto_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     msg = update.message
@@ -375,21 +459,27 @@ async def setphoto_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await context.bot.get_file(photo.file_id)
         await context.bot.set_chat_photo(update.effective_chat.id, file.file_id)
         await msg.reply_text("✅ Group photo updated.")
-    except Exception as e:
-        await msg.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("setphoto error: %s", e)
+        await msg.reply_text("❌ Failed — bot needs 'Change Group Info' permission.")
 
 
 async def delphoto_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     try:
         await context.bot.delete_chat_photo(update.effective_chat.id)
         await update.message.reply_text("✅ Group photo removed.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("delphoto error: %s", e)
+        await update.message.reply_text("❌ Failed — bot needs 'Change Group Info' permission.")
 
 
 async def slowmode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not context.args or not context.args[0].isdigit():
@@ -400,98 +490,104 @@ async def slowmode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.set_chat_slow_mode_delay(update.effective_chat.id, sec)
         msg = f"⏱️ Slow mode set to <b>{sec}s</b>." if sec > 0 else "⏱️ Slow mode <b>disabled</b>."
         await update.message.reply_text(msg, parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("slowmode error: %s", e)
+        await update.message.reply_text("❌ Failed — bot needs 'Restrict Members' rights.")
 
 
 async def invitelink_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     try:
         link = await context.bot.export_chat_invite_link(update.effective_chat.id)
         await update.message.reply_text(f"🔗 <b>Invite Link:</b>\n{link}", parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("invitelink error: %s", e)
+        await update.message.reply_text("❌ Failed — bot needs 'Invite Users' rights.")
 
 
 async def revokeinvite_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     try:
-        await context.bot.revoke_chat_invite_link(
-            update.effective_chat.id,
-            await context.bot.export_chat_invite_link(update.effective_chat.id),
-        )
+        old_link = await context.bot.export_chat_invite_link(update.effective_chat.id)
+        await context.bot.revoke_chat_invite_link(update.effective_chat.id, old_link)
         new_link = await context.bot.export_chat_invite_link(update.effective_chat.id)
         await update.message.reply_text(
             f"🔄 Invite link revoked.\n🔗 <b>New link:</b>\n{new_link}", parse_mode="HTML"
         )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("revokeinvite error: %s", e)
+        await update.message.reply_text("❌ Failed — bot needs 'Invite Users' rights.")
 
 
-async def _toggle_perm(update, context, perm_name: str, flag: bool):
-    """Generic permission toggler."""
+async def _toggle_perm(update: Update, context: ContextTypes.DEFAULT_TYPE, perm_name: str, flag: bool):
     chat_id = update.effective_chat.id
-    current = await context.bot.get_chat(chat_id)
-    perms = current.permissions or ChatPermissions()
-    perms_dict = {
-        "can_send_messages": perms.can_send_messages,
-        "can_send_media_messages": perms.can_send_media_messages,
-        "can_send_other_messages": perms.can_send_other_messages,
-        "can_add_web_page_previews": perms.can_add_web_page_previews,
-        "can_send_polls": perms.can_send_polls,
-    }
-    perms_dict[perm_name] = flag
-    await context.bot.set_chat_permissions(chat_id, ChatPermissions(**perms_dict))
+    try:
+        current = await context.bot.get_chat(chat_id)
+        perms = current.permissions or ChatPermissions()
+        perms_dict = {
+            "can_send_messages": perms.can_send_messages,
+            "can_send_media_messages": perms.can_send_media_messages,
+            "can_send_other_messages": perms.can_send_other_messages,
+            "can_add_web_page_previews": perms.can_add_web_page_previews,
+            "can_send_polls": perms.can_send_polls,
+        }
+        perms_dict[perm_name] = flag
+        await context.bot.set_chat_permissions(chat_id, ChatPermissions(**perms_dict))
+        return True
+    except (BadRequest, Forbidden) as e:
+        logger.warning("_toggle_perm (%s) error: %s", perm_name, e)
+        await update.message.reply_text("❌ Failed — bot needs 'Restrict Members' rights.")
+        return False
 
 
 async def stickers_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not context.args or context.args[0] not in ("on", "off"):
         await update.message.reply_text("Usage: /stickers on|off")
         return
     flag = context.args[0] == "on"
-    try:
-        await _toggle_perm(update, context, "can_send_other_messages", flag)
-        state = "enabled" if flag else "disabled"
-        await update.message.reply_text(f"🎭 Stickers <b>{state}</b>.", parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    if await _toggle_perm(update, context, "can_send_other_messages", flag):
+        await update.message.reply_text(f"🎭 Stickers <b>{'enabled' if flag else 'disabled'}</b>.", parse_mode="HTML")
 
 
 async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not context.args or context.args[0] not in ("on", "off"):
         await update.message.reply_text("Usage: /media on|off")
         return
     flag = context.args[0] == "on"
-    try:
-        await _toggle_perm(update, context, "can_send_media_messages", flag)
-        state = "enabled" if flag else "disabled"
-        await update.message.reply_text(f"🖼️ Media <b>{state}</b>.", parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    if await _toggle_perm(update, context, "can_send_media_messages", flag):
+        await update.message.reply_text(f"🖼️ Media <b>{'enabled' if flag else 'disabled'}</b>.", parse_mode="HTML")
 
 
 async def polls_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not context.args or context.args[0] not in ("on", "off"):
         await update.message.reply_text("Usage: /polls on|off")
         return
     flag = context.args[0] == "on"
-    try:
-        await _toggle_perm(update, context, "can_send_polls", flag)
-        state = "enabled" if flag else "disabled"
-        await update.message.reply_text(f"📊 Polls <b>{state}</b>.", parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    if await _toggle_perm(update, context, "can_send_polls", flag):
+        await update.message.reply_text(f"📊 Polls <b>{'enabled' if flag else 'disabled'}</b>.", parse_mode="HTML")
 
 
 async def setperm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     perm_map = {
@@ -507,29 +603,26 @@ async def setperm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
         return
-    perm_name = perm_map[context.args[0]]
     flag = context.args[1] == "on"
-    try:
-        await _toggle_perm(update, context, perm_name, flag)
-        state = "on" if flag else "off"
+    if await _toggle_perm(update, context, perm_map[context.args[0]], flag):
         await update.message.reply_text(
-            f"✅ Permission <code>{_esc(context.args[0])}</code> set to <b>{state}</b>.",
+            f"✅ Permission <code>{_esc(context.args[0])}</code> → <b>{'on' if flag else 'off'}</b>.",
             parse_mode="HTML",
         )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
 
 
-# ─── 🛡️ ANTI-FLOOD MODULE ─────────────────────────────────────────────────────
+# ─── 🛡️ ANTI-FLOOD (GROUP ONLY) ──────────────────────────────────────────────
 
 async def antiflood_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     db = _db(context)
     chat_id = update.effective_chat.id
     doc = db["groups"].find_one({"_id": chat_id}) or {}
-
     args = context.args
+
     if not args:
         on = doc.get("f_on", False)
         lim = doc.get("f_lim", 5)
@@ -537,11 +630,9 @@ async def antiflood_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mut = doc.get("f_mut", 10)
         state = "🟢 ON" if on else "🔴 OFF"
         await update.message.reply_text(
-            f"🛡️ <b>Anti-Flood Settings</b>\n\n"
+            f"🛡️ <b>Anti-Flood</b>\n\n"
             f"Status: {state}\n"
-            f"Limit: <b>{lim}</b> messages\n"
-            f"Window: <b>{win}s</b>\n"
-            f"Mute duration: <b>{mut} min</b>\n\n"
+            f"Limit: <b>{lim}</b> msgs / <b>{win}s</b> → mute <b>{mut} min</b>\n\n"
             "Change: /antiflood on|off [limit] [window_sec] [mute_min]",
             parse_mode="HTML",
         )
@@ -551,29 +642,37 @@ async def antiflood_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /antiflood on|off [limit] [window_sec] [mute_min]")
         return
 
-    update_data = {
+    upd = {
         "f_on": args[0] == "on",
         "f_lim": int(args[1]) if len(args) > 1 and args[1].isdigit() else doc.get("f_lim", 5),
         "f_win": int(args[2]) if len(args) > 2 and args[2].isdigit() else doc.get("f_win", 8),
         "f_mut": int(args[3]) if len(args) > 3 and args[3].isdigit() else doc.get("f_mut", 10),
     }
-    db["groups"].update_one({"_id": chat_id}, {"$set": update_data}, upsert=True)
-    state = "🟢 ON" if update_data["f_on"] else "🔴 OFF"
+    db["groups"].update_one({"_id": chat_id}, {"$set": upd}, upsert=True)
+    state = "🟢 ON" if upd["f_on"] else "🔴 OFF"
     await update.message.reply_text(
-        f"✅ Anti-flood {state}\n"
-        f"Limit: <b>{update_data['f_lim']}</b> msgs / <b>{update_data['f_win']}s</b> → mute <b>{update_data['f_mut']} min</b>",
+        f"✅ Anti-flood {state} — "
+        f"Limit: <b>{upd['f_lim']}</b> msgs / <b>{upd['f_win']}s</b> → mute <b>{upd['f_mut']} min</b>",
         parse_mode="HTML",
     )
 
 
 async def flood_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Passive flood checker — runs on every message (group=1)."""
+    """Passive flood checker — group=1."""
     db = _db(context)
     chat = update.effective_chat
     user = update.effective_user
-    if not chat or not user or chat.type == "private" or user.is_bot:
+    if not chat or not user or chat.type == ChatType.PRIVATE or user.is_bot:
         return
-    if await _is_admin(update, context):
+    if update.effective_user.id == OWNER_ID:
+        return
+
+    # Fast admin check using cached status (avoid API call on every message)
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            return
+    except TelegramError:
         return
 
     doc = db["groups"].find_one({"_id": chat.id}) if db else None
@@ -583,11 +682,9 @@ async def flood_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lim = doc.get("f_lim", 5)
     win = doc.get("f_win", 8)
     mut = doc.get("f_mut", 10)
-
     now = time.time()
     timestamps = _flood_cache[chat.id][user.id]
     timestamps.append(now)
-    # Keep only within window
     _flood_cache[chat.id][user.id] = [t for t in timestamps if now - t <= win]
 
     if len(_flood_cache[chat.id][user.id]) > lim:
@@ -603,21 +700,21 @@ async def flood_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🚫 <b>{_esc(user.full_name)}</b> muted for {mut} min (flood detected).",
                 parse_mode="HTML",
             )
-        except Exception as e:
+        except (BadRequest, Forbidden) as e:
             logger.warning("Flood mute error: %s", e)
 
 
-# ─── ℹ️ INFO MODULE ───────────────────────────────────────────────────────────
+# ─── ℹ️ INFO (ANY CONTEXT) ────────────────────────────────────────────────────
 
 async def id_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     lines = [f"👤 <b>Your ID:</b> <code>{user.id}</code>"]
-    if chat.type != "private":
+    if chat.type != ChatType.PRIVATE:
         lines.append(f"💬 <b>Group ID:</b> <code>{chat.id}</code>")
     if update.message.reply_to_message:
         t = update.message.reply_to_message.from_user
-        lines.append(f"↩️ <b>Replied user ID:</b> <code>{t.id}</code>  ({_esc(t.full_name)})")
+        lines.append(f"↩️ <b>Replied user ID:</b> <code>{t.id}</code> ({_esc(t.full_name)})")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
@@ -628,131 +725,109 @@ async def info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif err:
         await update.message.reply_text(err, parse_mode="HTML")
         return
-
     db = _db(context)
     doc = db["users"].find_one({"_id": target.id}) if db else {}
-
     uname = f"@{_esc(target.username)}" if target.username else "N/A"
     warn_count = (doc or {}).get("w_cnt", 0)
     last_seen_ts = (doc or {}).get("last")
     last_seen = datetime.fromtimestamp(last_seen_ts).strftime("%Y-%m-%d %H:%M") if last_seen_ts else "Unknown"
-
-    lines = [
-        f"ℹ️ <b>User Info</b>",
-        f"Name: <b>{_esc(target.full_name)}</b>",
-        f"Username: {uname}",
-        f"ID: <code>{target.id}</code>",
-        f"Warnings: <b>{warn_count}</b>/3",
+    await update.message.reply_text(
+        f"ℹ️ <b>User Info</b>\n"
+        f"Name: <b>{_esc(target.full_name)}</b>\n"
+        f"Username: {uname}\n"
+        f"ID: <code>{target.id}</code>\n"
+        f"Warnings: <b>{warn_count}</b>/3\n"
         f"Last seen: {last_seen}",
-    ]
-    if target.is_bot:
-        lines.append("Type: 🤖 Bot")
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-
-# ─── 🧹 AUTO CLEANUP MODULE ───────────────────────────────────────────────────
-
-async def cleandeleted_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await _require_admin(update, context):
-        return
-    db = _db(context)
-    chat_id = update.effective_chat.id
-    kicked = 0
-    failed = 0
-    # Iterate tracked users and check if they're deleted accounts
-    tracked_users = list(db["users"].find({}, {"_id": 1}))
-    msg = await update.message.reply_text(
-        f"🔍 Checking {len(tracked_users)} tracked users...", parse_mode="HTML"
-    )
-    for doc in tracked_users:
-        try:
-            member = await context.bot.get_chat_member(chat_id, doc["_id"])
-            user = member.user
-            if user.is_bot:
-                continue
-            # Deleted accounts have no first_name and username is None
-            if not user.first_name and not user.username:
-                await context.bot.ban_chat_member(chat_id, doc["_id"])
-                await context.bot.unban_chat_member(chat_id, doc["_id"])  # Soft kick
-                kicked += 1
-        except Exception:
-            failed += 1
-    await msg.edit_text(
-        f"🧹 <b>Clean Deleted</b>\n\n✅ Removed: {kicked}\n⚠️ Skipped/errors: {failed}",
         parse_mode="HTML",
     )
 
 
-async def cleaninactive_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ─── 🧹 AUTO CLEANUP (GROUP ONLY) ────────────────────────────────────────────
+
+async def cleandeleted_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
-    days = 30
-    if context.args and context.args[0].isdigit():
-        days = int(context.args[0])
+    db = _db(context)
+    chat_id = update.effective_chat.id
+    kicked = 0
+    tracked = list(db["users"].find({}, {"_id": 1}))
+    msg = await update.message.reply_text(f"🔍 Checking {len(tracked)} tracked users...")
+    for doc in tracked:
+        try:
+            member = await context.bot.get_chat_member(chat_id, doc["_id"])
+            user = member.user
+            if not user.first_name and not user.username and not user.is_bot:
+                await context.bot.ban_chat_member(chat_id, doc["_id"])
+                await context.bot.unban_chat_member(chat_id, doc["_id"])
+                kicked += 1
+        except (BadRequest, Forbidden):
+            pass
+    await msg.edit_text(f"🧹 <b>Clean Deleted</b> — Removed: <b>{kicked}</b>", parse_mode="HTML")
+
+
+async def cleaninactive_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
+    if not await _require_admin(update, context):
+        return
+    days = int(context.args[0]) if context.args and context.args[0].isdigit() else 30
     db = _db(context)
     chat_id = update.effective_chat.id
     cutoff = int(time.time()) - (days * 86400)
-    inactive_users = list(db["users"].find({"last": {"$lt": cutoff}}, {"_id": 1}))
+    inactive = list(db["users"].find({"last": {"$lt": cutoff}}, {"_id": 1}))
     kicked = 0
-    msg = await update.message.reply_text(
-        f"🔍 Found {len(inactive_users)} users inactive for {days}+ days..."
-    )
-    for doc in inactive_users:
+    msg = await update.message.reply_text(f"🔍 Found {len(inactive)} users inactive for {days}+ days...")
+    for doc in inactive:
         try:
             await context.bot.get_chat_member(chat_id, doc["_id"])
             await context.bot.ban_chat_member(chat_id, doc["_id"])
             await context.bot.unban_chat_member(chat_id, doc["_id"])
             kicked += 1
-        except Exception:
+        except (BadRequest, Forbidden):
             pass
     await msg.edit_text(
-        f"🧹 <b>Clean Inactive ({days}d)</b>\n\n✅ Removed: {kicked}",
-        parse_mode="HTML",
+        f"🧹 <b>Clean Inactive ({days}d)</b> — Removed: <b>{kicked}</b>", parse_mode="HTML"
     )
 
 
 async def autoclean_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not context.args or context.args[0] not in ("on", "off"):
         await update.message.reply_text("Usage: /autoclean on|off [days]")
         return
-    db = _db(context)
     flag = context.args[0] == "on"
     days = int(context.args[1]) if len(context.args) > 1 and context.args[1].isdigit() else 30
-    db["groups"].update_one(
-        {"_id": update.effective_chat.id},
-        {"$set": {"ac_on": flag, "ac_days": days}},
-        upsert=True,
+    _db(context)["groups"].update_one(
+        {"_id": update.effective_chat.id}, {"$set": {"ac_on": flag, "ac_days": days}}, upsert=True
     )
     state = "🟢 ON" if flag else "🔴 OFF"
     await update.message.reply_text(
-        f"🧹 Auto-clean {state} (inactive for <b>{days}</b> days).",
-        parse_mode="HTML",
+        f"🧹 Auto-clean {state} (inactive >{days}d).", parse_mode="HTML"
     )
 
 
 async def autokickdeleted_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not context.args or context.args[0] not in ("on", "off"):
         await update.message.reply_text("Usage: /autokickdeleted on|off")
         return
-    db = _db(context)
     flag = context.args[0] == "on"
-    db["groups"].update_one(
-        {"_id": update.effective_chat.id},
-        {"$set": {"akd_on": flag}},
-        upsert=True,
+    _db(context)["groups"].update_one(
+        {"_id": update.effective_chat.id}, {"$set": {"akd_on": flag}}, upsert=True
     )
     state = "🟢 ON" if flag else "🔴 OFF"
-    await update.message.reply_text(
-        f"🗑️ Auto-kick deleted accounts {state}.",
-        parse_mode="HTML",
-    )
+    await update.message.reply_text(f"🗑️ Auto-kick deleted accounts {state}.", parse_mode="HTML")
 
 
-# ─── 🔒 CONTENT LOCK MODULE ───────────────────────────────────────────────────
+# ─── 🔒 CONTENT LOCK (GROUP ONLY) ────────────────────────────────────────────
 
 _LOCK_KEYS = {
     "messages": "l_msg",
@@ -765,42 +840,38 @@ _LOCK_KEYS = {
 
 
 async def lock_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not context.args or context.args[0] not in _LOCK_KEYS:
         await update.message.reply_text(
-            f"Usage: /lock &lt;type&gt;\nTypes: {', '.join(_LOCK_KEYS.keys())}",
-            parse_mode="HTML",
+            f"Usage: /lock &lt;type&gt;\nTypes: {', '.join(_LOCK_KEYS.keys())}", parse_mode="HTML"
         )
         return
     key = _LOCK_KEYS[context.args[0]]
-    _db(context)["groups"].update_one(
-        {"_id": update.effective_chat.id}, {"$set": {key: True}}, upsert=True
-    )
-    await update.message.reply_text(
-        f"🔒 <b>{_esc(context.args[0])}</b> locked.", parse_mode="HTML"
-    )
+    _db(context)["groups"].update_one({"_id": update.effective_chat.id}, {"$set": {key: True}}, upsert=True)
+    await update.message.reply_text(f"🔒 <b>{_esc(context.args[0])}</b> locked.", parse_mode="HTML")
 
 
 async def unlock_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not context.args or context.args[0] not in _LOCK_KEYS:
         await update.message.reply_text(
-            f"Usage: /unlock &lt;type&gt;\nTypes: {', '.join(_LOCK_KEYS.keys())}",
-            parse_mode="HTML",
+            f"Usage: /unlock &lt;type&gt;\nTypes: {', '.join(_LOCK_KEYS.keys())}", parse_mode="HTML"
         )
         return
     key = _LOCK_KEYS[context.args[0]]
-    _db(context)["groups"].update_one(
-        {"_id": update.effective_chat.id}, {"$set": {key: False}}, upsert=True
-    )
-    await update.message.reply_text(
-        f"🔓 <b>{_esc(context.args[0])}</b> unlocked.", parse_mode="HTML"
-    )
+    _db(context)["groups"].update_one({"_id": update.effective_chat.id}, {"$set": {key: False}}, upsert=True)
+    await update.message.reply_text(f"🔓 <b>{_esc(context.args[0])}</b> unlocked.", parse_mode="HTML")
 
 
 async def locklist_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     db = _db(context)
     doc = db["groups"].find_one({"_id": update.effective_chat.id}) or {}
     lines = ["🔒 <b>Content Lock Status</b>\n"]
@@ -813,6 +884,8 @@ async def locklist_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     try:
@@ -822,12 +895,15 @@ async def ro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _db(context)["groups"].update_one(
             {"_id": update.effective_chat.id}, {"$set": {"ro": True}}, upsert=True
         )
-        await update.message.reply_text("🔇 Read-only mode <b>enabled</b>. Only admins can message.", parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+        await update.message.reply_text("🔇 Read-only mode <b>enabled</b>.", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("ro error: %s", e)
+        await update.message.reply_text("❌ Failed — bot needs 'Restrict Members' rights.")
 
 
 async def unro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     try:
@@ -844,27 +920,31 @@ async def unro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {"_id": update.effective_chat.id}, {"$set": {"ro": False}}, upsert=True
         )
         await update.message.reply_text("🔊 Read-only mode <b>disabled</b>.", parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("unro error: %s", e)
+        await update.message.reply_text("❌ Failed — bot needs 'Restrict Members' rights.")
 
 
 async def lock_enforcer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Auto-delete messages that violate active locks (group=0, before other handlers)."""
+    """Auto-delete messages that violate active locks. group=0."""
     db = _db(context)
     chat = update.effective_chat
     user = update.effective_user
     msg = update.message
-    if not chat or not user or chat.type == "private" or user.is_bot:
+    if not chat or not user or chat.type == ChatType.PRIVATE or user.is_bot:
         return
-    if await _is_admin(update, context):
+    if user.id == OWNER_ID:
+        return
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+            return
+    except TelegramError:
         return
 
     doc = db["groups"].find_one({"_id": chat.id}) if db else None
     if not doc:
         return
-
-    import re
-    URL_RE = re.compile(r"(https?://|t\.me/|www\.)", re.IGNORECASE)
 
     should_delete = False
     if doc.get("l_msg") and msg.text and not msg.text.startswith("/"):
@@ -883,17 +963,19 @@ async def lock_enforcer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if should_delete:
         try:
             await msg.delete()
-        except Exception as e:
+        except (BadRequest, Forbidden) as e:
             logger.warning("lock_enforcer delete error: %s", e)
 
 
-# ─── 👋 WELCOME & RULES MODULE ────────────────────────────────────────────────
+# ─── 👋 WELCOME & RULES ───────────────────────────────────────────────────────
 
 async def setwelcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not context.args:
-        await update.message.reply_text("Usage: /setwelcome <text> (use {name} for the member's name)")
+        await update.message.reply_text("Usage: /setwelcome <text> (use {name} for member's name)")
         return
     text = " ".join(context.args)
     _db(context)["groups"].update_one(
@@ -905,20 +987,23 @@ async def setwelcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def getwelcome_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     doc = _db(context)["groups"].find_one({"_id": update.effective_chat.id}) or {}
     msg = doc.get("wlcm")
     on = doc.get("wlcm_on", True)
     if msg:
         state = "🟢 ON" if on else "🔴 OFF"
         await update.message.reply_text(
-            f"👋 <b>Current welcome message</b> [{state}]:\n\n{_esc(msg)}",
-            parse_mode="HTML",
+            f"👋 <b>Current welcome message</b> [{state}]:\n\n{_esc(msg)}", parse_mode="HTML"
         )
     else:
         await update.message.reply_text("No custom welcome message set.")
 
 
 async def welcome_toggle_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not context.args or context.args[0] not in ("on", "off"):
@@ -933,30 +1018,33 @@ async def welcome_toggle_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def rules_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     doc = _db(context)["groups"].find_one({"_id": update.effective_chat.id}) or {}
     rules = doc.get("rules")
     if rules:
-        await update.message.reply_text(
-            f"📜 <b>Group Rules</b>\n\n{_esc(rules)}", parse_mode="HTML"
-        )
+        await update.message.reply_text(f"📜 <b>Group Rules</b>\n\n{_esc(rules)}", parse_mode="HTML")
     else:
-        await update.message.reply_text("No rules set for this group. Use /setrules to add some.")
+        await update.message.reply_text("No rules set. Use /setrules to add some.")
 
 
 async def setrules_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not context.args:
         await update.message.reply_text("Usage: /setrules <rules text>")
         return
-    text = " ".join(context.args)
     _db(context)["groups"].update_one(
-        {"_id": update.effective_chat.id}, {"$set": {"rules": text}}, upsert=True
+        {"_id": update.effective_chat.id}, {"$set": {"rules": " ".join(context.args)}}, upsert=True
     )
     await update.message.reply_text("✅ Rules saved.")
 
 
 async def clearrules_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     _db(context)["groups"].update_one(
@@ -974,34 +1062,39 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     for member in update.message.new_chat_members:
         if member.id == context.bot.id:
-            if db:
-                _track_group(chat, db)
-            await update.message.reply_text(
-                f"👋 Thanks for adding me to <b>{_esc(chat.title)}</b>!\n"
-                "Give me admin rights to enable all features.",
-                parse_mode="HTML",
-            )
+            try:
+                await update.message.reply_text(
+                    f"👋 Thanks for adding me to <b>{_esc(chat.title)}</b>!\n"
+                    "Give me admin rights to enable all features.",
+                    parse_mode="HTML",
+                )
+            except (BadRequest, Forbidden):
+                pass
             continue
         if member.is_bot:
             continue
         if db:
             _track_user(member, db)
-
-        if group_doc and group_doc.get("wlcm_on", True):
-            custom = group_doc.get("wlcm")
+        if group_doc and not group_doc.get("wlcm_on", True):
+            continue
+        custom = (group_doc or {}).get("wlcm")
+        try:
             if custom:
-                text = custom.replace("{name}", member.full_name)
-                await update.message.reply_text(text)
+                await update.message.reply_text(custom.replace("{name}", member.full_name))
             else:
                 await update.message.reply_text(
-                    f"👋 Welcome to the group, <b>{_esc(member.full_name)}</b>! Please read the /rules.",
+                    f"👋 Welcome, <b>{_esc(member.full_name)}</b>! Please read the /rules.",
                     parse_mode="HTML",
                 )
+        except (BadRequest, Forbidden):
+            pass
 
 
-# ─── 🛡️ MODERATION ENGINE ─────────────────────────────────────────────────────
+# ─── 🛡️ MODERATION (GROUP ONLY) ──────────────────────────────────────────────
 
 async def ban_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     target, err = await _get_target(update, context)
@@ -1010,14 +1103,15 @@ async def ban_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, target.id)
-        await update.message.reply_text(
-            f"🔨 <b>{_esc(target.full_name)}</b> has been banned.", parse_mode="HTML"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ban failed: {_esc(str(e))}", parse_mode="HTML")
+        await update.message.reply_text(f"🔨 <b>{_esc(target.full_name)}</b> has been banned.", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("ban error: %s", e)
+        await update.message.reply_text("❌ Ban failed — bot needs 'Ban Users' rights.")
 
 
 async def unban_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     target, err = await _get_target(update, context)
@@ -1026,14 +1120,15 @@ async def unban_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await context.bot.unban_chat_member(update.effective_chat.id, target.id, only_if_banned=True)
-        await update.message.reply_text(
-            f"✅ <b>{_esc(target.full_name)}</b> has been unbanned.", parse_mode="HTML"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Unban failed: {_esc(str(e))}", parse_mode="HTML")
+        await update.message.reply_text(f"✅ <b>{_esc(target.full_name)}</b> has been unbanned.", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("unban error: %s", e)
+        await update.message.reply_text("❌ Unban failed — bot needs 'Ban Users' rights.")
 
 
 async def kick_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     target, err = await _get_target(update, context)
@@ -1043,42 +1138,37 @@ async def kick_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.ban_chat_member(update.effective_chat.id, target.id)
         await context.bot.unban_chat_member(update.effective_chat.id, target.id)
-        await update.message.reply_text(
-            f"👢 <b>{_esc(target.full_name)}</b> has been kicked.", parse_mode="HTML"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Kick failed: {_esc(str(e))}", parse_mode="HTML")
+        await update.message.reply_text(f"👢 <b>{_esc(target.full_name)}</b> has been kicked.", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("kick error: %s", e)
+        await update.message.reply_text("❌ Kick failed — bot needs 'Ban Users' rights.")
 
 
 def _parse_duration(raw: str) -> int | None:
-    """Parse duration string like 1m, 2h, 3d into seconds."""
-    if not raw:
-        return None
     units = {"m": 60, "h": 3600, "d": 86400}
-    unit = raw[-1].lower()
+    unit = raw[-1].lower() if raw else ""
     if unit in units and raw[:-1].isdigit():
         return int(raw[:-1]) * units[unit]
     return None
 
 
 async def mute_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     target, err = await _get_target(update, context)
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
         return
-
-    # Duration: last arg if it looks like 1m/1h/1d
     until = None
     duration_str = ""
-    remaining_args = list(context.args or [])
-    if remaining_args:
-        dur_secs = _parse_duration(remaining_args[-1])
+    args = list(context.args or [])
+    if args:
+        dur_secs = _parse_duration(args[-1])
         if dur_secs:
             until = datetime.now() + timedelta(seconds=dur_secs)
-            duration_str = f" for {_esc(remaining_args[-1])}"
-
+            duration_str = f" for <b>{_esc(args[-1])}</b>"
     try:
         await context.bot.restrict_chat_member(
             update.effective_chat.id, target.id,
@@ -1088,11 +1178,14 @@ async def mute_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"🔇 <b>{_esc(target.full_name)}</b> muted{duration_str}.", parse_mode="HTML"
         )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Mute failed: {_esc(str(e))}", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("mute error: %s", e)
+        await update.message.reply_text("❌ Mute failed — bot needs 'Restrict Members' rights.")
 
 
 async def unmute_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     target, err = await _get_target(update, context)
@@ -1103,20 +1196,19 @@ async def unmute_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.restrict_chat_member(
             update.effective_chat.id, target.id,
             ChatPermissions(
-                can_send_messages=True,
-                can_send_media_messages=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True,
+                can_send_messages=True, can_send_media_messages=True,
+                can_send_other_messages=True, can_add_web_page_previews=True,
             ),
         )
-        await update.message.reply_text(
-            f"🔊 <b>{_esc(target.full_name)}</b> unmuted.", parse_mode="HTML"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Unmute failed: {_esc(str(e))}", parse_mode="HTML")
+        await update.message.reply_text(f"🔊 <b>{_esc(target.full_name)}</b> unmuted.", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("unmute error: %s", e)
+        await update.message.reply_text("❌ Unmute failed — bot needs 'Restrict Members' rights.")
 
 
 async def warn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     target, err = await _get_target(update, context)
@@ -1124,16 +1216,13 @@ async def warn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(err, parse_mode="HTML")
         return
     db = _db(context)
-    reason_args = list(context.args or [])
-    if update.message.reply_to_message and reason_args and reason_args[0].startswith("@"):
-        reason_args = reason_args[1:]
-    reason = " ".join(reason_args) if reason_args else "No reason provided"
+    args = list(context.args or [])
+    if args and (args[0].startswith("@") or args[0].isdigit()):
+        args = args[1:]
+    reason = " ".join(args) if args else "No reason provided"
 
     doc = db["users"].find_one_and_update(
-        {"_id": target.id},
-        {"$inc": {"w_cnt": 1}},
-        upsert=True,
-        return_document=True,
+        {"_id": target.id}, {"$inc": {"w_cnt": 1}}, upsert=True, return_document=True
     )
     warn_count = (doc or {}).get("w_cnt", 1)
 
@@ -1142,11 +1231,11 @@ async def warn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.ban_chat_member(update.effective_chat.id, target.id)
             db["users"].update_one({"_id": target.id}, {"$set": {"w_cnt": 0}})
             await update.message.reply_text(
-                f"🔨 <b>{_esc(target.full_name)}</b> reached 3 warnings and has been auto-banned.",
-                parse_mode="HTML",
+                f"🔨 <b>{_esc(target.full_name)}</b> reached 3 warnings — auto-banned.", parse_mode="HTML"
             )
-        except Exception as e:
-            await update.message.reply_text(f"❌ Auto-ban failed: {_esc(str(e))}", parse_mode="HTML")
+        except (BadRequest, Forbidden) as e:
+            logger.warning("warn auto-ban error: %s", e)
+            await update.message.reply_text("❌ Auto-ban failed — bot needs 'Ban Users' rights.")
     else:
         await update.message.reply_text(
             f"⚠️ <b>{_esc(target.full_name)}</b> — warning {warn_count}/3\nReason: {_esc(reason)}",
@@ -1155,6 +1244,8 @@ async def warn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def unwarn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     target, err = await _get_target(update, context)
@@ -1165,14 +1256,11 @@ async def unwarn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = db["users"].find_one({"_id": target.id}) or {}
     current = doc.get("w_cnt", 0)
     if current == 0:
-        await update.message.reply_text(
-            f"<b>{_esc(target.full_name)}</b> has no warnings.", parse_mode="HTML"
-        )
+        await update.message.reply_text(f"<b>{_esc(target.full_name)}</b> has no warnings.", parse_mode="HTML")
         return
     db["users"].update_one({"_id": target.id}, {"$inc": {"w_cnt": -1}})
     await update.message.reply_text(
-        f"✅ 1 warning removed from <b>{_esc(target.full_name)}</b>. Warnings: {current - 1}/3",
-        parse_mode="HTML",
+        f"✅ 1 warning removed from <b>{_esc(target.full_name)}</b>. Now: {current - 1}/3", parse_mode="HTML"
     )
 
 
@@ -1184,11 +1272,13 @@ async def warns_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = db["users"].find_one({"_id": target.id}) or {}
     count = doc.get("w_cnt", 0)
     await update.message.reply_text(
-        f"⚠️ <b>{_esc(target.full_name)}</b> has <b>{count}/3</b> warnings.", parse_mode="HTML"
+        f"⚠️ <b>{_esc(target.full_name)}</b> — <b>{count}/3</b> warnings.", parse_mode="HTML"
     )
 
 
 async def resetwarn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     target, err = await _get_target(update, context)
@@ -1202,11 +1292,12 @@ async def resetwarn_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def clearwarns_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Alias for resetwarn."""
     await resetwarn_handler(update, context)
 
 
 async def promote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     target, err = await _get_target(update, context)
@@ -1216,21 +1307,21 @@ async def promote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.promote_chat_member(
             update.effective_chat.id, target.id,
-            can_change_info=True,
-            can_delete_messages=True,
-            can_restrict_members=True,
-            can_invite_users=True,
-            can_pin_messages=True,
-            can_manage_chat=True,
+            can_change_info=True, can_delete_messages=True,
+            can_restrict_members=True, can_invite_users=True,
+            can_pin_messages=True, can_manage_chat=True,
         )
         await update.message.reply_text(
             f"⬆️ <b>{_esc(target.full_name)}</b> promoted to admin.", parse_mode="HTML"
         )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Promote failed: {_esc(str(e))}", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("promote error: %s", e)
+        await update.message.reply_text("❌ Promote failed — bot must be an admin with 'Add Admins' rights.")
 
 
 async def demote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     target, err = await _get_target(update, context)
@@ -1240,48 +1331,45 @@ async def demote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.promote_chat_member(
             update.effective_chat.id, target.id,
-            can_change_info=False,
-            can_delete_messages=False,
-            can_restrict_members=False,
-            can_invite_users=False,
-            can_pin_messages=False,
-            can_manage_chat=False,
+            can_change_info=False, can_delete_messages=False,
+            can_restrict_members=False, can_invite_users=False,
+            can_pin_messages=False, can_manage_chat=False,
         )
-        await update.message.reply_text(
-            f"⬇️ <b>{_esc(target.full_name)}</b> demoted.", parse_mode="HTML"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Demote failed: {_esc(str(e))}", parse_mode="HTML")
+        await update.message.reply_text(f"⬇️ <b>{_esc(target.full_name)}</b> demoted.", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("demote error: %s", e)
+        await update.message.reply_text("❌ Demote failed — bot needs 'Add Admins' rights.")
 
 
 async def title_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     target, err = await _get_target(update, context)
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
         return
-    # Title is everything after the username/reply arg
     args = list(context.args or [])
     if args and (args[0].startswith("@") or args[0].isdigit()):
         args = args[1:]
     if not args:
         await update.message.reply_text("Usage: /title @user <custom title>")
         return
-    custom_title = " ".join(args)[:16]  # Telegram limit: 16 chars
+    custom_title = " ".join(args)[:16]
     try:
-        await context.bot.set_chat_administrator_custom_title(
-            update.effective_chat.id, target.id, custom_title
-        )
+        await context.bot.set_chat_administrator_custom_title(update.effective_chat.id, target.id, custom_title)
         await update.message.reply_text(
-            f"🏷️ <b>{_esc(target.full_name)}</b>'s title set to: <i>{_esc(custom_title)}</i>",
-            parse_mode="HTML",
+            f"🏷️ <b>{_esc(target.full_name)}</b>'s title → <i>{_esc(custom_title)}</i>", parse_mode="HTML"
         )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("title error: %s", e)
+        await update.message.reply_text("❌ Failed — target must be an admin promoted by this bot.")
 
 
 async def pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not update.message.reply_to_message:
@@ -1292,11 +1380,14 @@ async def pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update.effective_chat.id, update.message.reply_to_message.message_id
         )
         await update.message.reply_text("📌 Message pinned.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("pin error: %s", e)
+        await update.message.reply_text("❌ Failed — bot needs 'Pin Messages' rights.")
 
 
 async def unpin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     try:
@@ -1307,21 +1398,27 @@ async def unpin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await context.bot.unpin_chat_message(update.effective_chat.id)
         await update.message.reply_text("📌 Message unpinned.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("unpin error: %s", e)
+        await update.message.reply_text("❌ Failed — bot needs 'Pin Messages' rights.")
 
 
 async def unpinall_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     try:
         await context.bot.unpin_all_chat_messages(update.effective_chat.id)
         await update.message.reply_text("📌 All messages unpinned.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("unpinall error: %s", e)
+        await update.message.reply_text("❌ Failed — bot needs 'Pin Messages' rights.")
 
 
 async def del_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not update.message.reply_to_message:
@@ -1330,11 +1427,14 @@ async def del_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_to_message.delete()
         await update.message.delete()
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed: {_esc(str(e))}", parse_mode="HTML")
+    except (BadRequest, Forbidden) as e:
+        logger.warning("del error: %s", e)
+        await update.message.reply_text("❌ Failed — bot needs 'Delete Messages' rights.")
 
 
 async def purge_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not await _require_admin(update, context):
         return
     if not update.message.reply_to_message:
@@ -1342,24 +1442,27 @@ async def purge_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     start_id = update.message.reply_to_message.message_id
     end_id = update.message.message_id
-    max_delete = int(context.args[0]) if context.args and context.args[0].isdigit() else end_id - start_id + 1
+    max_delete = int(context.args[0]) if context.args and context.args[0].isdigit() else (end_id - start_id + 1)
     deleted = 0
     for msg_id in range(start_id, min(end_id + 1, start_id + max_delete + 1)):
         try:
             await context.bot.delete_message(update.effective_chat.id, msg_id)
             deleted += 1
-        except Exception:
+        except (BadRequest, Forbidden):
             pass
-    status = await update.message.reply_text(f"🗑️ Purged <b>{deleted}</b> messages.", parse_mode="HTML")
-    import asyncio
-    await asyncio.sleep(3)
     try:
+        status = await update.message.reply_text(
+            f"🗑️ Purged <b>{deleted}</b> messages.", parse_mode="HTML"
+        )
+        await asyncio.sleep(3)
         await status.delete()
-    except Exception:
+    except (BadRequest, Forbidden):
         pass
 
 
 async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _require_group(update):
+        return
     if not update.message.reply_to_message:
         await update.message.reply_text("↩️ Reply to the message you want to report.")
         return
@@ -1367,12 +1470,10 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reporter = update.effective_user
     reported = update.message.reply_to_message.from_user
     reason = " ".join(context.args) if context.args else "No reason given"
-
     try:
         admins = await context.bot.get_chat_administrators(chat.id)
-    except Exception:
+    except TelegramError:
         admins = []
-
     report_text = (
         f"🚨 <b>Report in {_esc(chat.title)}</b>\n\n"
         f"Reporter: <a href='tg://user?id={reporter.id}'>{_esc(reporter.full_name)}</a>\n"
@@ -1384,12 +1485,12 @@ async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         try:
             await context.bot.send_message(admin.user.id, report_text, parse_mode="HTML")
-        except Exception:
+        except (BadRequest, Forbidden):
             pass
     await update.message.reply_text("✅ Report sent to all admins.", parse_mode="HTML")
 
 
-# ─── 📢 BROADCAST ─────────────────────────────────────────────────────────────
+# ─── 📢 BROADCAST (OWNER, PM ONLY) ───────────────────────────────────────────
 
 async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
@@ -1400,7 +1501,7 @@ async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("👥 All Users", callback_data="bc_users"),
             InlineKeyboardButton("🏘️ All Groups", callback_data="bc_groups"),
         ],
-        [InlineKeyboardButton("🌐 Everyone (Users + Groups)", callback_data="bc_all")],
+        [InlineKeyboardButton("🌐 Everyone", callback_data="bc_all")],
         [InlineKeyboardButton("❌ Cancel", callback_data="bc_cancel")],
     ]
     await update.message.reply_text(
@@ -1429,7 +1530,7 @@ async def broadcast_target_callback(update: Update, context: ContextTypes.DEFAUL
     await query.answer()
     label = {"users": "👥 All Users", "groups": "🏘️ All Groups", "all": "🌐 Everyone"}[target]
     await query.edit_message_text(
-        f"📢 <b>Broadcast to {label}</b>\n\nSend your message now (text, photo, or video):",
+        f"📢 <b>Broadcast to {label}</b>\n\nSend your message now:",
         parse_mode="HTML",
     )
 
@@ -1460,10 +1561,10 @@ async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif msg.video:
                 await context.bot.send_video(chat_id, msg.video.file_id, caption=msg.caption or "")
             else:
-                await context.bot.copy_message(chat_id, from_chat_id=msg.chat_id, message_id=msg.message_id)
+                await context.bot.copy_message(chat_id, msg.chat_id, msg.message_id)
             sent += 1
-        except Exception as e:
-            logger.warning("Broadcast failed for %s: %s", chat_id, e)
+        except (BadRequest, Forbidden) as e:
+            logger.warning("Broadcast fail %s: %s", chat_id, e)
             failed += 1
     await update.message.reply_text(
         f"📢 <b>Broadcast complete</b>\n\n✅ Sent: {sent}\n❌ Failed: {failed}",
@@ -1514,26 +1615,26 @@ async def grouplist_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = _db(context)
     chat_id = update.effective_chat.id
-    if db:
+    if db and update.effective_chat.type != ChatType.PRIVATE:
         _track_group(update.effective_chat, db)
     try:
         member_count = await context.bot.get_chat_member_count(chat_id)
-    except Exception:
+    except TelegramError:
         member_count = "N/A"
     warned_users = db["users"].count_documents({"w_cnt": {"$gt": 0}}) if db else 0
     total_users = db["users"].count_documents({}) if db else 0
     total_groups = db["groups"].count_documents({}) if db else 0
     await update.message.reply_text(
         f"📊 <b>Statistics</b>\n\n"
-        f"👥 Members in this group: <b>{member_count}</b>\n"
-        f"📝 Total tracked users: <b>{total_users}</b>\n"
-        f"🏘️ Total managed groups: <b>{total_groups}</b>\n"
+        f"👥 Members here: <b>{member_count}</b>\n"
+        f"📝 Tracked users: <b>{total_users}</b>\n"
+        f"🏘️ Managed groups: <b>{total_groups}</b>\n"
         f"⚠️ Users with warnings: <b>{warned_users}</b>",
         parse_mode="HTML",
     )
 
 
-# ─── Passive message tracker ─────────────────────────────────────────────────
+# ─── Passive Tracker ─────────────────────────────────────────────────────────
 
 async def message_tracker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = _db(context)
